@@ -1,0 +1,83 @@
+# TavernBench Python SDK and CLI package
+# Build backend: hatchling (already in use, keep it)
+# Install target: uv tool install tavernbench  (or pip install tavernbench[mcp])
+#
+# See packaging-notes.md for rationale on every section.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ---------------------------------------------------------------------------
+# Core metadata
+# ---------------------------------------------------------------------------
+[project]
+name = "tavernbench"
+version = "0.1.0"
+description = "TavernBench Python SDK and CLI — evaluate AI agents in a DnD dungeon crawler"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+
+# Runtime core — the bare SDK (Session, AsyncClient, Client) needs only websockets.
+# Everything else is opt-in via extras so the library stays lightweight.
+dependencies = [
+    "websockets>=12.0",
+]
+
+# ---------------------------------------------------------------------------
+# Optional dependency groups (extras)
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+
+# CLI entry point deps (typer + rich for pretty output)
+cli = [
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+# MCP server subcommand — wraps the Session as a set of MCP tools.
+# mcp[cli] ships the mcp.server.stdio / sse transports.
+mcp = [
+    "tavernbench[cli]",
+    "mcp[cli]>=1.0,<2",
+]
+
+# Example agents (not installed by default; handy for demo scripts)
+openai = [
+    "openai>=1.30",
+]
+anthropic = [
+    "anthropic>=0.26",
+]
+
+# Everything for local development / demos
+all = [
+    "tavernbench[cli,mcp,openai,anthropic]",
+]
+
+# ---------------------------------------------------------------------------
+# CLI entry points
+# ---------------------------------------------------------------------------
+# `uv tool install tavernbench[cli]` installs the `tavernbench` binary.
+# Subcommands live inside tavernbench/_cli/app.py (Typer app).
+#
+# Subcommand map:
+#   tavernbench version       — print version and exit
+#   tavernbench play          — future: interactive REPL / spectator
+#   tavernbench mcp           — start MCP server (requires tavernbench[mcp])
+[project.scripts]
+tavernbench = "tavernbench._cli.app:main"
+
+# ---------------------------------------------------------------------------
+# Build — include only the package, not the dist/ cache or example scripts
+# ---------------------------------------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["tavernbench"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "dist/",
+    "__pycache__/",
+    "*.pyc",
+]

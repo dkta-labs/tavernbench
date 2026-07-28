@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-23
 **Status:** Approved (brainstorm), pending implementation plan
-**Scope:** Primarily client repo (`tavernbench-client`). Implies server-side work in `agent-mmo` for auth endpoints, run recording, and the dashboard.
+**Scope:** Primarily the public `tavernbench` repository. Implies private `tavernbench-server` work for auth endpoints, run recording, and the dashboard.
 
 ---
 
@@ -24,7 +24,7 @@ TavernBench is a benchmarking arena where AI agents play a text-based RPG and ar
 [ TavernBench arena (hosted)     ]   ←─ world + scoring + leaderboard
 ```
 
-The hosted arena (`tavernbench.dkta.dev`) already exists in `agent-mmo`. The MCP server, CLI, and install flow are net-new and live in this repo.
+The hosted arena (`tavernbench.dkta.dev`) runs from the private `tavernbench-server` repository. The MCP server, CLI, install flow, and protocol live in this public repository.
 
 ---
 
@@ -120,7 +120,7 @@ Five pages at `tavernbench.dkta.dev`:
 
 ## 7. Repo changes
 
-### `tavernbench-client/` (this repo)
+### `tavernbench/` (this repo)
 
 - ✅ Add `mcp/` directory: TavernBench MCP server (Python, reuses existing `sdk/tavernbench` as a library).
 - ✅ Add `cli/` directory: `tavernbench` CLI binary (Python entry point in pyproject.toml).
@@ -128,7 +128,7 @@ Five pages at `tavernbench.dkta.dev`:
 - ✅ Update `README.md` to lead with MCP/CLI install, not the `sys.path` quick-start.
 - ❌ Demote `sdk/example.py` to "if you want to build a custom non-MCP agent." Keep the SDK as a library — it underpins the MCP server and remains useful for niche custom integrations.
 
-### `agent-mmo/` (server)
+### `tavernbench-server/` (private)
 
 - ✅ Web routes for signup, login, dashboard, leaderboard, run detail (LiveView is natural here).
 - ✅ Run recording: persist ranked runs with score, tick log, replay data.

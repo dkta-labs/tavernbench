@@ -11,7 +11,7 @@ set -euo pipefail
 #   curl -fsSL https://tavernbench.dkta.dev/install.sh | bash -s -- --for=cursor
 #   curl -fsSL https://tavernbench.dkta.dev/install.sh | bash -s -- --for=codex
 
-REPO="https://github.com/dkta0/tavernbench-client"
+REPO="https://github.com/dkta-labs/tavernbench"
 INSTALL_DIR="${HOME}/.tavernbench"
 BIN_DIR="${HOME}/.local/bin"
 FOR_CLIENT=""
@@ -40,8 +40,9 @@ else
   git clone --depth 1 "${REPO}" "${INSTALL_DIR}"
 fi
 
-# ── install Python CLI ────────────────────────────────────────────────────────
-echo "==> Installing tavernbench CLI..."
+# ── install Python SDK and CLI ────────────────────────────────────────────────
+echo "==> Installing TavernBench SDK and CLI..."
+pip install --quiet --user -e "${INSTALL_DIR}/sdk"
 pip install --quiet --user -e "${INSTALL_DIR}/cli"
 
 # Ensure ~/.local/bin is on PATH (shell rc files)

@@ -1,20 +1,18 @@
-# TavernBench Client
+# TavernBench
 
-TavernBench is an agent benchmarking arena where AI agents navigate a text-based world — moving through zones, speaking with NPCs, completing quests, and battling enemies — while being scored on efficiency and completion. This repo contains the official Python SDK and Go TUI for connecting to a TavernBench server.
+TavernBench is a long-horizon evaluation arena where AI agents navigate a real-time multiplayer world—moving through zones, speaking with NPCs, completing quests, and battling enemies while being scored on efficiency and completion. This public repository is the canonical home of the protocol, Python SDK, CLI, MCP integration, and Go TUI. The hosted server implementation and held-out evaluation machinery are private.
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dkta0/tavernbench-client/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dkta-labs/tavernbench/main/install.sh | bash
 ```
 
-This clones the SDK into `~/.tavernbench/` and installs the `websockets` dependency.
+This installs the Python SDK and CLI under `~/.tavernbench/`.
 
 ## Quick Start
 
 ```python
-import sys
-sys.path.insert(0, "~/.tavernbench/sdk")
 import asyncio
 import tavernbench as tb
 
@@ -46,8 +44,10 @@ See `sdk/example.py` for a full agent loop with movement, combat, and dialogue.
 ## Repo layout
 
 ```
-sdk/          Python SDK (tavernbench package + example.py)
-tui/          Go terminal UI for spectating / playing
-docs/         Protocol specification
+sdk/          Python SDK (`tavernbench` package)
+cli/          Command-line client and agent-host registration
+mcp/          MCP server
+tui/          Go terminal UI for spectating and playing
+docs/         Canonical protocol specification and design documents
 install.sh    One-line installer
 ```
