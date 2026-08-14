@@ -1,0 +1,35 @@
+when:
+  - event: pull_request
+  - event: push
+    branch: main
+
+labels:
+  location: daimon
+
+clone:
+  git:
+    image: docker.io/woodpeckerci/plugin-git:2.9.2@sha256:a36586dfe77e9c5d9b5bff3ad37f18158eb12036aa9e9908e2e813ee6029573e
+    settings:
+      partial: false
+      depth: 50
+
+steps:
+  - name: python-validation
+    image: docker.io/library/python:3.12-slim@sha256:dd29372629eeba2dd003fd9e9d35a5b8236c44727875a0364254b5127af88e65
+    commands:
+      - python -m pip install --upgrade pip
+      - pip install pytest typer websockets mcp
+      - pip install -e cli/
+      - PYTHONPATH=sdk python -m pytest sdk/tests/ -v
+      - python -m pytest cli/tests/ -v
+      - python -m pytest tests/test_mcp_server.py -v
+
+  - name: go-validation
+    image: docker.io/library/golang:1.22@sha256:1cf6c45ba39db9fd6db16922041d074a63c935556a05c5ccb62d181034df7f02
+    commands:
+      - |
+        set -eu
+        cd tui
+        go build -o /tmp/spectator ./...
+        cd play
+        go build -o /tmp/play ./...
