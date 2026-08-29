@@ -1,84 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# TavernBench Installer
-# Installs the tavernbench CLI to ~/.local/bin/ and (optionally) registers
-# the MCP server with your agent client.
-#
-# Usage:
-#   curl -fsSL https://tavernbench.dkta.dev/install.sh | bash
-#   curl -fsSL https://tavernbench.dkta.dev/install.sh | bash -s -- --for=claude-code
-#   curl -fsSL https://tavernbench.dkta.dev/install.sh | bash -s -- --for=cursor
-#   curl -fsSL https://tavernbench.dkta.dev/install.sh | bash -s -- --for=codex
-
 REPO="https://github.com/dkta-labs/tavernbench"
 INSTALL_DIR="${HOME}/.tavernbench"
 BIN_DIR="${HOME}/.local/bin"
-FOR_CLIENT=""
+WITH_MCP="false"
 
-# ── parse flags ───────────────────────────────────────────────────────────────
 for arg in "$@"; do
   case "$arg" in
-    --for=*)
-      FOR_CLIENT="${arg#--for=}"
-      ;;
+    --mcp) WITH_MCP="true" ;;
     -h|--help)
-      head -20 "$0"
+      printf '%s\n' "Usage: install.sh [--mcp]" "Installs the TavernBench Behavior Lab HTTP v1 SDK and concierge CLI."
       exit 0
       ;;
+    *) printf 'Unknown option: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
 
-# ── clone / update repo ───────────────────────────────────────────────────────
-echo "==> Installing TavernBench to ${INSTALL_DIR}"
-
-if [ -d "${INSTALL_DIR}" ]; then
-  echo "==> Updating existing installation..."
+if [ -d "${INSTALL_DIR}/.git" ]; then
   git -C "${INSTALL_DIR}" pull --ff-only
 else
-  echo "==> Cloning repository..."
   git clone --depth 1 "${REPO}" "${INSTALL_DIR}"
 fi
 
-# ── install Python SDK and CLI ────────────────────────────────────────────────
-echo "==> Installing TavernBench SDK and CLI..."
-pip install --quiet --user -e "${INSTALL_DIR}/sdk"
-pip install --quiet --user -e "${INSTALL_DIR}/cli"
+python3 -m venv "${INSTALL_DIR}/.venv"
+if [ "${WITH_MCP}" = "true" ]; then
+  "${INSTALL_DIR}/.venv/bin/python" -m pip install "${INSTALL_DIR}/sdk[mcp]"
+else
+  "${INSTALL_DIR}/.venv/bin/python" -m pip install "${INSTALL_DIR}/sdk"
+fi
 
-# Ensure ~/.local/bin is on PATH (shell rc files)
 mkdir -p "${BIN_DIR}"
-if ! echo "$PATH" | grep -q "${BIN_DIR}"; then
-  echo ""
-  echo "  ⚠  Add ${BIN_DIR} to your PATH:"
-  echo "     echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
-  echo "     (or ~/.zshrc for zsh)"
-  echo ""
-fi
+ln -sfn "${INSTALL_DIR}/.venv/bin/tavernbench" "${BIN_DIR}/tavernbench"
 
-echo "  ✓ tavernbench CLI installed"
+printf '%s\n' \
+  "TavernBench Behavior Lab installed." \
+  "Create a dedicated account-owned API key at https://tavernbench.dkta.dev/dashboard" \
+  "At run time, prompt without shell history:" \
+  "export TAVERNBENCH_API_KEY=\"\$(python3 -c 'import getpass; print(getpass.getpass(\"TavernBench API key: \"))')\"" \
+  "Run: ${BIN_DIR}/tavernbench concierge --participant-code builder-01 --config-label baseline --export tavernbench-evidence.json"
 
-# ── register MCP server (optional) ───────────────────────────────────────────
-if [ -n "${FOR_CLIENT}" ]; then
-  echo "==> Registering MCP server for ${FOR_CLIENT}..."
-  "${BIN_DIR}/tavernbench" install "${FOR_CLIENT}" || \
-    python3 -m tavernbench_cli.main install "${FOR_CLIENT}"
+if [ "${WITH_MCP}" = "true" ]; then
+  printf '%s\n' \
+    "MCP command: ${INSTALL_DIR}/.venv/bin/python" \
+    "MCP args: ${INSTALL_DIR}/mcp/server.py" \
+    "Transport: stdio"
 fi
-
-# ── done ─────────────────────────────────────────────────────────────────────
-echo ""
-echo "✓ TavernBench installed!"
-echo ""
-echo "Next steps:"
-echo ""
-echo "  1. Get an API key:  https://tavernbench.dkta.dev"
-echo "  2. Authenticate:    tavernbench auth"
-if [ -z "${FOR_CLIENT}" ]; then
-echo "  3. Register MCP:    tavernbench install claude-code"
-echo "                      (or: cursor, codex)"
-fi
-echo "  4. Try it yourself: tavernbench play"
-echo ""
-echo "Then open your agent (e.g. Claude Code) and say:"
-echo "  \"Play a casual round of TavernBench.\""
-echo ""
-echo "Full docs: ${INSTALL_DIR}/README.md"

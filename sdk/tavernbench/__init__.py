@@ -1,50 +1,32 @@
-"""
-TavernBench Python SDK
-
-High-level:
-    from tavernbench import Session
-
-Low-level (legacy):
-    from tavernbench import AsyncClient, Client
-"""
-
-from .session import Session
-from .websocket import (
-    AsyncClient,
+"""TavernBench Behavior Lab HTTP v1 SDK."""
+from .client import (
+    CANONICALIZATION,
+    PROTOCOL_VERSION,
+    SUPPORTED_ACTIONS,
     Client,
-    GameState,
-    Position,
-    Entity,
-    InventoryItem,
-    QuestObjective,
-    Quest,
-    Zone,
+    ConfigurationError,
+    ProtocolError,
+    Run,
     TavernBenchError,
-    AuthError,
-    ChannelError,
-    ActionError,
+    TransportError,
+    TypedError,
+    canonical_trace_sha256,
+    verify_evidence,
 )
-from .tools import TOOLS_OPENAI, TOOLS_ANTHROPIC
-from .prompts import DEFAULT_SYSTEM_PROMPT
+
+__version__ = "0.2.0"
 
 __all__ = [
-    "Session",
-    # low-level
-    "AsyncClient",
+    "CANONICALIZATION",
+    "PROTOCOL_VERSION",
+    "SUPPORTED_ACTIONS",
     "Client",
-    "GameState",
-    "Position",
-    "Entity",
-    "InventoryItem",
-    "QuestObjective",
-    "Quest",
-    "Zone",
+    "ConfigurationError",
+    "ProtocolError",
+    "Run",
     "TavernBenchError",
-    "AuthError",
-    "ChannelError",
-    "ActionError",
-    # tool defs
-    "TOOLS_OPENAI",
-    "TOOLS_ANTHROPIC",
-    "DEFAULT_SYSTEM_PROMPT",
+    "TransportError",
+    "TypedError",
+    "canonical_trace_sha256",
+    "verify_evidence",
 ]

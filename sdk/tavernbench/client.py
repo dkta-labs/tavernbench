@@ -1,613 +1,257 @@
-"""
-TavernBench Python SDK — Phoenix Channels client over raw WebSocket.
-Protocol: /docs/protocol.md
-"""
+"""Fail-closed TavernBench Behavior Lab HTTP v1 client."""
 from __future__ import annotations
 
-import asyncio
+import hashlib
 import json
-import threading
-import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+import re
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+PROTOCOL_VERSION = "tavernbench.behavior/v1"
+CANONICALIZATION = "tavernbench-canonical-json/v1"
+SUPPORTED_ACTIONS = frozenset({"observe", "move", "enter", "speak", "reply", "examine", "pickup", "attack", "flee", "inventory", "quests"})
 
 
-# ---------------------------------------------------------------------------
-# State model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Position:
-    x: int
-    y: int
-
-    def __repr__(self):
-        return f"({self.x}, {self.y})"
+class TavernBenchError(RuntimeError):
+    """Base SDK failure. No SDK failure is converted to plausible run state."""
 
 
-@dataclass
-class Entity:
-    type: str          # player | npc | enemy | item | exit
+class ConfigurationError(TavernBenchError):
+    pass
+
+
+class TransportError(TavernBenchError):
+    pass
+
+
+class ProtocolError(TavernBenchError):
+    pass
+
+
+class TypedError(TavernBenchError):
+    def __init__(self, failure: Mapping[str, Any], status: int | None = None):
+        self.failure = dict(failure)
+        self.code = str(self.failure.get("code", "unknown_error"))
+        self.status = status
+        super().__init__(f"{self.code}: {self.failure.get('message', 'request failed')}")
+
+
+@dataclass(frozen=True)
+class Run:
     id: str
-    name: str
-    position: Position
-    distance: float
-    health: Optional[int] = None
-    max_health: Optional[int] = None
+    status: str
+    observation: dict[str, Any]
+    reset_proof: dict[str, Any]
+    raw: dict[str, Any]
 
-
-@dataclass
-class InventoryItem:
-    id: str
-    name: str
-    quantity: int
-
-
-@dataclass
-class QuestObjective:
-    id: str
-    description: str
-    complete: bool
-
-
-@dataclass
-class Quest:
-    id: str
-    name: str
-    description: str
-    objectives: List[QuestObjective]
-    complete: bool
-
-
-@dataclass
-class Zone:
-    id: str
-    width: int
-    height: int
-
-
-@dataclass
-class GameState:
-    """Updated on every tick broadcast."""
-    tick: int = 0
-    timestamp_ms: int = 0
-    zone_id: str = ""
-    zone: Optional[Zone] = None
-    position: Optional[Position] = None
-    entities: List[Entity] = field(default_factory=list)
-    inventory: List[InventoryItem] = field(default_factory=list)
-    quest_log: List[Quest] = field(default_factory=list)
-    score: int = 0
-    steps: int = 0
-    acked_seqs: List[int] = field(default_factory=list)
-
-    # helpers
-    def visible(self, type_filter: Optional[str] = None) -> List[Entity]:
-        if type_filter:
-            return [e for e in self.entities if e.type == type_filter]
-        return list(self.entities)
-
-    def nearest(self, type_filter: Optional[str] = None) -> Optional[Entity]:
-        candidates = self.visible(type_filter)
-        if not candidates:
-            return None
-        return min(candidates, key=lambda e: e.distance)
-
-    def get_entity(self, entity_id: str) -> Optional[Entity]:
-        return next((e for e in self.entities if e.id == entity_id), None)
-
-
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
-class TavernBenchError(Exception):
-    """Base SDK exception."""
-
-
-class AuthError(TavernBenchError):
-    """Raised when authentication fails (HTTP 403 before WS upgrade)."""
-
-
-class ChannelError(TavernBenchError):
-    """Raised when a channel join/action returns status='error'."""
-    def __init__(self, code: str, response: dict):
-        self.code = code
-        self.response = response
-        super().__init__(f"Channel error: {code} — {response}")
-
-
-class ActionError(TavernBenchError):
-    """Raised when an action reply comes back with status='error'."""
-    def __init__(self, code: str):
-        self.code = code
-        super().__init__(f"Action error: {code}")
-
-
-# ---------------------------------------------------------------------------
-# Async client
-# ---------------------------------------------------------------------------
-
-class AsyncClient:
-    """
-    Async TavernBench client.
-
-    Usage::
-
-        async with AsyncClient("ws://localhost:4100", api_key="test-key") as tb:
-            await tb.join("tavern_hall")
-            await tb.move("north")
-            print(tb.state.position)
-    """
-
-    PROTOCOL_VERSION = "1.0"
-
-    def __init__(
-        self,
-        host: str = "ws://localhost:4100",
-        api_key: str = "",
-        *,
-        heartbeat_interval: float = 30.0,
-        on_dialogue: Optional[Callable[[str, str, str, list], Any]] = None,
-        on_quest_complete: Optional[Callable[[int, int], Any]] = None,
-        on_event: Optional[Callable[[str, dict], Any]] = None,
-    ):
-        """
-        Args:
-            host: WebSocket base URL (ws:// or wss://).
-            api_key: API key passed as query param on connect.
-            heartbeat_interval: Seconds between heartbeat pings (default 30).
-            on_dialogue: callback(npc_id, npc_name, text, choices)
-            on_quest_complete: callback(final_score, steps_taken)
-            on_event: callback(event_type, payload_dict)
-        """
-        self.host = host.rstrip("/")
-        self.api_key = api_key
-        self.heartbeat_interval = heartbeat_interval
-        self.state = GameState()
-
-        # callbacks
-        self._on_dialogue = on_dialogue
-        self._on_quest_complete = on_quest_complete
-        self._on_event = on_event
-
-        self._ws = None
-        self._ref = 0
-        self._join_ref = None
-        self._topic: Optional[str] = None
-        self._player_id: Optional[str] = None
-        self._pending: Dict[str, asyncio.Future] = {}
-        self._recv_task: Optional[asyncio.Task] = None
-        self._hb_task: Optional[asyncio.Task] = None
-        self._connected = False
-        self._tick_event: Optional[asyncio.Event] = None
-
-    # ---- lifecycle --------------------------------------------------------
-
-    async def connect(self):
-        """Open the WebSocket connection. Called automatically by __aenter__."""
-        import websockets
-        uri = f"{self.host}/socket/websocket?api_key={self.api_key}&protocol_version={self.PROTOCOL_VERSION}&vsn=2.0.0"
-        try:
-            self._ws = await websockets.connect(uri)
-        except Exception as exc:
-            if "403" in str(exc) or "Forbidden" in str(exc):
-                raise AuthError(f"Server rejected API key (403): {exc}") from exc
-            raise
-        self._connected = True
-        self._recv_task = asyncio.create_task(self._recv_loop())
-        self._hb_task = asyncio.create_task(self._heartbeat_loop())
-
-    async def disconnect(self):
-        """Close the WebSocket and cancel background tasks."""
-        if self._recv_task:
-            self._recv_task.cancel()
-        if self._hb_task:
-            self._hb_task.cancel()
-        if self._ws:
-            await self._ws.close()
-        self._connected = False
-
-    async def __aenter__(self):
-        await self.connect()
-        return self
-
-    async def __aexit__(self, *_):
-        await self.disconnect()
-
-    # ---- channel management -----------------------------------------------
-
-    async def join(self, zone_id: str) -> dict:
-        """
-        Join a zone channel. Must be called before sending actions.
-
-        Args:
-            zone_id: Zone identifier, e.g. "tavern_hall".
-
-        Returns:
-            Server join reply payload.
-
-        Raises:
-            ChannelError: If the server rejects the join.
-        """
-        self._topic = f"zone:{zone_id}"
-        self._join_ref = self._next_ref()
-        fut = self._make_future(self._join_ref)
-        msg = [self._join_ref, self._join_ref, self._topic, "phx_join",
-               {"protocol_version": self.PROTOCOL_VERSION}]
-        await self._send(msg)
-        reply = await fut
-        if reply.get("status") != "ok":
-            raise ChannelError(
-                reply.get("response", {}).get("reason", "join_failed"),
-                reply.get("response", {}),
-            )
-        self._player_id = reply.get("response", {}).get("player_id")
-        initial_score = reply.get("response", {}).get("score")
-        if initial_score is not None:
-            self.state.score = initial_score
-        return reply
-
-    async def leave(self):
-        """Leave the current zone channel."""
-        if not self._topic:
-            return
-        ref = self._next_ref()
-        msg = [self._join_ref, ref, self._topic, "phx_leave", {}]
-        await self._send(msg)
-        self._topic = None
-
-    # ---- actions ----------------------------------------------------------
-
-    async def move(self, direction: str, seq: Optional[int] = None) -> dict:
-        """Move in a cardinal/intercardinal direction."""
-        payload: dict = {"direction": direction}
-        if seq is not None:
-            payload["seq"] = seq
-        return await self._action("action:move", payload)
-
-    async def enter(self, target: str) -> dict:
-        """Enter an exit/portal (zone transition)."""
-        return await self._action("action:enter", {"target": target})
-
-    async def speak(self, target: str) -> dict:
-        """Initiate dialogue with an NPC."""
-        return await self._action("action:speak", {"target": target})
-
-    async def reply(self, choice: int) -> dict:
-        """Select a dialogue choice."""
-        return await self._action("action:reply", {"choice": choice})
-
-    async def examine(self, target: str) -> dict:
-        """Examine an entity."""
-        return await self._action("action:examine", {"target": target})
-
-    async def pickup(self, target: str) -> dict:
-        """Pick up an item."""
-        return await self._action("action:pickup", {"target": target})
-
-    async def drop(self, item: str) -> dict:
-        """Drop an inventory item."""
-        return await self._action("action:drop", {"item": item})
-
-    async def use(self, item: str, target: Optional[str] = None) -> dict:
-        """Use an inventory item, optionally on a target."""
-        payload: dict = {"item": item}
-        if target is not None:
-            payload["target"] = target
-        return await self._action("action:use", payload)
-
-    async def attack(self, target: str) -> dict:
-        """Attack an enemy."""
-        return await self._action("action:attack", {"target": target})
-
-    async def flee(self) -> dict:
-        """Flee from combat."""
-        return await self._action("action:flee", {})
-
-    async def inventory(self) -> dict:
-        """Request inventory list (triggers 'inventory' event push)."""
-        return await self._action("action:inventory", {})
-
-    async def quests(self) -> dict:
-        """Request quest log (triggers 'quests' event push)."""
-        return await self._action("action:quests", {})
-
-    async def look(self) -> dict:
-        """Request immediate state broadcast."""
-        return await self._action("action:look", {})
-
-    async def wait_turn(self) -> dict:
-        """Do nothing for this tick."""
-        return await self._action("action:wait", {})
-
-    async def wait_tick(self, n: int = 1):
-        """Await n tick broadcasts from the server."""
-        for _ in range(n):
-            await self._wait_for_tick()
-
-    # ---- internals --------------------------------------------------------
-
-    def _next_ref(self) -> str:
-        self._ref += 1
-        return str(self._ref)
-
-    def _make_future(self, ref: str) -> asyncio.Future:
-        loop = asyncio.get_event_loop()
-        fut: asyncio.Future = loop.create_future()
-        self._pending[ref] = fut
-        return fut
-
-    async def _send(self, msg: list):
-        await self._ws.send(json.dumps(msg))
-
-    async def _action(self, event: str, payload: dict) -> dict:
-        if not self._topic:
-            raise TavernBenchError("Not joined to any zone. Call join() first.")
-        ref = self._next_ref()
-        fut = self._make_future(ref)
-        msg = [self._join_ref, ref, self._topic, event, payload]
-        await self._send(msg)
-        reply = await asyncio.wait_for(fut, timeout=10.0)
-        if reply.get("status") == "error":
-            code = reply.get("response", {}).get("code", "UNKNOWN_ERROR")
-            raise ActionError(code)
-        return reply
-
-    async def _recv_loop(self):
-        try:
-            async for raw in self._ws:
-                try:
-                    msg = json.loads(raw)
-                    await self._dispatch(msg)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    async def _dispatch(self, msg: list):
-        if not isinstance(msg, list) or len(msg) != 5:
-            return
-        join_ref, ref, topic, event, payload = msg
-
-        # resolve pending futures
-        if event == "phx_reply" and ref and ref in self._pending:
-            fut = self._pending.pop(ref)
-            if not fut.done():
-                fut.set_result(payload)
-            return
-
-        # state tick
-        if event == "tick":
-            self._apply_tick(payload)
-            if self._tick_event is not None:
-                self._tick_event.set()
-                self._tick_event = None
-            return
-
-        # dialogue push
-        if event == "dialogue":
-            if self._on_dialogue:
-                asyncio.ensure_future(
-                    self._call_async_or_sync(
-                        self._on_dialogue,
-                        payload.get("npc_id", ""),
-                        payload.get("npc", ""),
-                        payload.get("text", ""),
-                        payload.get("choices", []),
-                    )
-                )
-            return
-
-        # quest_complete push
-        if event == "quest_complete":
-            if self._on_quest_complete:
-                asyncio.ensure_future(
-                    self._call_async_or_sync(
-                        self._on_quest_complete,
-                        payload.get("final_score", 0),
-                        payload.get("steps_taken", 0),
-                    )
-                )
-            return
-
-        # generic event push
-        if event == "event":
-            etype = payload.get("type", "")
-            if etype == "zone_change":
-                # The Phoenix channel server re-subscribes to the new zone's PubSub
-                # and updates socket.assigns.zone_id server-side. We do NOT change
-                # self._topic here — all actions continue going to the original joined
-                # topic; the channel process routes them to the correct zone.
-                new_zone = payload.get("to_zone") or payload.get("zone_id")
-                if new_zone:
-                    self.state.zone_id = new_zone
-            elif etype == "score_update":
-                score = payload.get("score")
-                if score is not None:
-                    self.state.score = score
-            if self._on_event:
-                asyncio.ensure_future(
-                    self._call_async_or_sync(self._on_event, etype, payload)
-                )
-            return
-
-    async def _call_async_or_sync(self, fn, *args):
-        result = fn(*args)
-        if asyncio.iscoroutine(result):
-            await result
-
-    def _apply_tick(self, p: dict):
-        s = self.state
-        s.tick = p.get("tick", s.tick)
-        s.timestamp_ms = p.get("timestamp_ms", s.timestamp_ms)
-        s.zone_id = p.get("zone_id", s.zone_id)
-        if "zone" in p:
-            z = p["zone"]
-            s.zone = Zone(id=z["id"], width=z["width"], height=z["height"])
-        if "position" in p:
-            pos = p["position"]
-            s.position = Position(x=pos["x"], y=pos["y"])
-        if "entities" in p:
-            s.entities = [
-                Entity(
-                    type=e["type"],
-                    id=e["id"],
-                    name=e["name"],
-                    position=Position(x=e["position"]["x"], y=e["position"]["y"]),
-                    distance=e.get("distance", 0.0),
-                    health=e.get("health"),
-                    max_health=e.get("max_health"),
-                )
-                for e in p["entities"]
-            ]
-            # Extract own position from the player entity matching our player_id
-            if "position" not in p:
-                for e in p["entities"]:
-                    is_self = (
-                        self._player_id and e.get("id") == f"player_{self._player_id}"
-                    ) or (
-                        e.get("type") == "player" and float(e.get("distance", -1)) == 0.0
-                        and not self._player_id
-                    )
-                    if is_self:
-                        s.position = Position(x=e["position"]["x"], y=e["position"]["y"])
-                        break
-        if "inventory" in p:
-            s.inventory = [
-                InventoryItem(id=i["id"], name=i["name"], quantity=i["quantity"])
-                for i in p["inventory"]
-            ]
-        if "quest_log" in p:
-            s.quest_log = [
-                Quest(
-                    id=q["id"],
-                    name=q["name"],
-                    description=q.get("description", ""),
-                    objectives=[
-                        QuestObjective(id=o["id"], description=o["description"], complete=o["complete"])
-                        for o in q.get("objectives", [])
-                    ],
-                    complete=q.get("complete", False),
-                )
-                for q in p["quest_log"]
-            ]
-        if "score" in p:
-            s.score = p["score"]
-        if "steps" in p:
-            s.steps = p["steps"]
-        if "acked_seqs" in p:
-            s.acked_seqs = p["acked_seqs"]
-
-    async def _wait_for_tick(self):
-        self._tick_event = asyncio.Event()
-        await asyncio.wait_for(self._tick_event.wait(), timeout=5.0)
-
-    async def _heartbeat_loop(self):
-        hb_ref = 0
-        while True:
-            await asyncio.sleep(self.heartbeat_interval)
-            hb_ref += 1
-            msg = [None, f"hb-{hb_ref}", "phoenix", "heartbeat", {}]
-            try:
-                await self._send(msg)
-            except Exception:
-                break
-
-
-# ---------------------------------------------------------------------------
-# Blocking (sync) wrapper
-# ---------------------------------------------------------------------------
 
 class Client:
-    """
-    Blocking TavernBench client. Wraps AsyncClient and runs an event loop
-    in a background thread.
+    """One persistent logical client for account-owned Behavior Lab runs."""
 
-    Usage::
+    def __init__(self, host: str, api_key: str, *, timeout: float = 15.0):
+        host = host.rstrip("/")
+        parsed = urllib.parse.urlparse(host)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ConfigurationError("TAVERNBENCH_HOST must use http:// or https://")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+            raise ConfigurationError("TAVERNBENCH_HOST must be an origin without userinfo, path, query, or fragment")
+        if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ConfigurationError("Bearer API keys require HTTPS except on explicit loopback hosts")
+        if not re.fullmatch(r"tb_[0-9a-f]{32}", api_key):
+            raise ConfigurationError("a valid account-owned TavernBench API key is required")
+        self.host = host
+        self._api_key = api_key
+        self.timeout = timeout
 
-        with Client("ws://localhost:4100", api_key="test-key") as tb:
-            tb.join("tavern_hall")
-            tb.move("north")
-            print(tb.state.position)
-    """
+    @classmethod
+    def from_env(cls, *, timeout: float = 15.0) -> "Client":
+        api_key = os.environ.get("TAVERNBENCH_API_KEY", "")
+        host = os.environ.get("TAVERNBENCH_HOST", "https://tavernbench.dkta.dev")
+        return cls(host, api_key, timeout=timeout)
 
-    def __init__(self, host: str = "ws://localhost:4100", api_key: str = "", **kwargs):
-        self._async = AsyncClient(host, api_key, **kwargs)
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
-
-    @property
-    def state(self) -> GameState:
-        return self._async.state
-
-    def connect(self):
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
-        self._thread.start()
-        self._run(self._async.connect())
-
-    def disconnect(self):
-        self._run(self._async.disconnect())
-        self._loop.call_soon_threadsafe(self._loop.stop)
-
-    def __enter__(self):
-        self.connect()
+    def __enter__(self) -> "Client":
         return self
 
-    def __exit__(self, *_):
-        self.disconnect()
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
-    def _run(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=15)
+    def close(self) -> None:
+        """The stdlib transport holds no background connection or process."""
 
-    def join(self, zone_id: str) -> dict:
-        return self._run(self._async.join(zone_id))
+    def start_run(
+        self,
+        *,
+        participant_code: str | None = None,
+        episode_kind: str = "initial",
+        agent_metadata: Mapping[str, Any] | None = None,
+    ) -> Run:
+        body: dict[str, Any] = {
+            "scenario_id": "missing_apprentice",
+            "episode_kind": episode_kind,
+            "agent_metadata": dict(agent_metadata or {}),
+        }
+        if participant_code is not None:
+            body["participant_code"] = participant_code
+        data = self._request("POST", "/api/v1/research-runs", body)
+        run = _mapping(data.get("run"), "start response run")
+        observation = _mapping(data.get("observation"), "start response observation")
+        reset_proof = _mapping(data.get("reset_proof"), "start response reset_proof")
+        if run.get("protocol_version") != PROTOCOL_VERSION:
+            raise ProtocolError("server run protocol_version does not match the SDK")
+        if not isinstance(run.get("id"), str) or not isinstance(run.get("status"), str):
+            raise ProtocolError("start response is missing run identity or status")
+        return Run(run["id"], run["status"], observation, reset_proof, data)
 
-    def leave(self):
-        return self._run(self._async.leave())
+    def act(
+        self,
+        run_id: str,
+        *,
+        action: str,
+        direction: str | None = None,
+        target: str | None = None,
+        choice: int | None = None,
+    ) -> dict[str, Any]:
+        if action not in SUPPORTED_ACTIONS:
+            raise ProtocolError(f"unsupported action {action!r}")
+        body: dict[str, Any] = {"action": action}
+        if direction is not None:
+            body["direction"] = direction
+        if target is not None:
+            body["target"] = target
+        if choice is not None:
+            body["choice"] = choice
+        return self._request("POST", f"/api/v1/research-runs/{run_id}/actions", body)
 
-    def move(self, direction: str, seq: Optional[int] = None) -> dict:
-        return self._run(self._async.move(direction, seq))
+    def annotate(self, run_id: str, *, label: str, note: str, action_sequence: int) -> dict[str, Any]:
+        return self._request("POST", f"/api/v1/research-runs/{run_id}/annotations", {"label": label, "note": note, "action_sequence": action_sequence})
 
-    def enter(self, target: str) -> dict:
-        return self._run(self._async.enter(target))
+    def abort(self, run_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/api/v1/research-runs/{run_id}/abort", {})
 
-    def speak(self, target: str) -> dict:
-        return self._run(self._async.speak(target))
+    def evidence(self, run_id: str) -> dict[str, Any]:
+        evidence = self._request("GET", f"/api/v1/research-runs/{run_id}/evidence")
+        run = _mapping(evidence.get("run"), "evidence run")
+        integrity = _mapping(evidence.get("integrity"), "evidence integrity")
+        trace = evidence.get("trace")
+        if run.get("protocol_version") != PROTOCOL_VERSION:
+            raise ProtocolError("evidence protocol_version does not match the SDK")
+        if not isinstance(trace, list) or not all(isinstance(entry, dict) for entry in trace):
+            raise ProtocolError("evidence trace must be an array of objects")
+        if not isinstance(integrity.get("status"), str):
+            raise ProtocolError("evidence integrity status is missing")
+        return evidence
 
-    def reply(self, choice: int) -> dict:
-        return self._run(self._async.reply(choice))
+    def export(self, run_id: str, path: str | os.PathLike[str]) -> dict[str, Any]:
+        evidence = self.evidence(run_id)
+        if not verify_evidence(evidence):
+            raise ProtocolError("evidence seal verification failed")
+        target = Path(path)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow == 0 and target.is_symlink():
+            raise ProtocolError("evidence export path must not be a symlink")
+        try:
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow, 0o600)
+        except OSError as error:
+            raise ProtocolError("evidence export path could not be opened safely") from error
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(json.dumps(evidence, indent=2, ensure_ascii=False) + "\n")
+        return evidence
 
-    def examine(self, target: str) -> dict:
-        return self._run(self._async.examine(target))
+    def list_runs(self) -> list[dict[str, Any]]:
+        runs = self._request("GET", "/api/v1/research-runs").get("runs")
+        if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
+            raise ProtocolError("run list response is invalid")
+        return runs
 
-    def pickup(self, target: str) -> dict:
-        return self._run(self._async.pickup(target))
+    def list_scenarios(self) -> list[dict[str, Any]]:
+        value = self._request_value("GET", "/api/scenarios")
+        if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+            raise ProtocolError("Phase 1 requires exactly one scenario object")
+        scenario = value[0]
+        if scenario.get("id") != "missing_apprentice" or scenario.get("schema_version") != "tavernbench-scenario/v1" or scenario.get("protocol_version") != PROTOCOL_VERSION:
+            raise ProtocolError("scenario inventory does not match the Phase 1 contract")
+        return value
 
-    def drop(self, item: str) -> dict:
-        return self._run(self._async.drop(item))
+    def _request(self, method: str, path: str, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        value = self._request_value(method, path, body)
+        if not isinstance(value, dict):
+            raise ProtocolError("server returned a non-object JSON response")
+        return value
 
-    def use(self, item: str, target: Optional[str] = None) -> dict:
-        return self._run(self._async.use(item, target))
+    def _request_value(self, method: str, path: str, body: Mapping[str, Any] | None = None) -> Any:
+        payload = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            self.host + path,
+            data=payload,
+            method=method,
+            headers={"Accept": "application/json", "Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return _decode_json_value(response.read())
+        except urllib.error.HTTPError as error:
+            try:
+                data = _decode_json_value(error.read())
+            except ProtocolError as invalid:
+                raise ProtocolError("HTTP failure body is not valid JSON") from invalid
+            if not isinstance(data, dict) or "error" not in data:
+                raise TransportError(f"HTTP {error.code} without a typed TavernBench failure") from error
+            failure = _validated_failure(data["error"])
+            raise TypedError(failure, error.code) from error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise TransportError(f"TavernBench request failed: {type(error).__name__}") from error
 
-    def attack(self, target: str) -> dict:
-        return self._run(self._async.attack(target))
 
-    def flee(self) -> dict:
-        return self._run(self._async.flee())
+def canonical_trace_sha256(evidence: Mapping[str, Any]) -> str:
+    integrity = _mapping(evidence.get("integrity"), "evidence integrity")
+    if integrity.get("canonicalization") != CANONICALIZATION:
+        raise ProtocolError("unsupported evidence canonicalization")
+    trace = evidence.get("trace")
+    if not isinstance(trace, list):
+        raise ProtocolError("evidence trace must be an array")
+    projection = []
+    for entry in trace:
+        if not isinstance(entry, dict):
+            raise ProtocolError("evidence trace entry must be an object")
+        try:
+            projection.append({key: entry[key] for key in ("sequence", "kind", "schema_version", "occurred_at", "payload")})
+        except KeyError as error:
+            raise ProtocolError("evidence trace entry is missing a sealed field") from error
+    encoded = json.dumps(projection, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
-    def inventory(self) -> dict:
-        return self._run(self._async.inventory())
 
-    def quests(self) -> dict:
-        return self._run(self._async.quests())
+def verify_evidence(evidence: Mapping[str, Any]) -> bool:
+    integrity = _mapping(evidence.get("integrity"), "evidence integrity")
+    sealed = integrity.get("sealed_sha256")
+    return isinstance(sealed, str) and sealed == canonical_trace_sha256(evidence)
 
-    def look(self) -> dict:
-        return self._run(self._async.look())
 
-    def wait_turn(self) -> dict:
-        return self._run(self._async.wait_turn())
+def _mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ProtocolError(f"{label} must be an object")
+    return value
 
-    def wait_tick(self, n: int = 1):
-        return self._run(self._async.wait_tick(n))
+
+def _validated_failure(value: Any) -> dict[str, Any]:
+    failure = _mapping(value, "failure envelope")
+    if failure.get("schema_version") != "tavernbench-failure/v1":
+        raise ProtocolError("failure envelope has an unsupported schema_version")
+    if not all(isinstance(failure.get(field), str) and failure[field] for field in ("code", "category", "message")):
+        raise ProtocolError("failure envelope is missing typed string fields")
+    if not isinstance(failure.get("retryable"), bool) or not isinstance(failure.get("details"), dict):
+        raise ProtocolError("failure envelope retryable/details types are invalid")
+    return failure
+
+
+def _decode_json_value(payload: bytes) -> Any:
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProtocolError("server returned invalid JSON") from error
