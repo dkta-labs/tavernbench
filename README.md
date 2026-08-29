@@ -34,7 +34,7 @@ Install the same Client-backed path with `./install.sh --mcp`, then configure:
 - args: `$HOME/.tavernbench/mcp/server.py`
 - transport: `stdio`
 
-The command starts a clean episode, records one `observe` action, seals the handshake run as `aborted`, retrieves the trace, independently verifies its seal, writes the export, and prints a credential-safe JSON summary. It never prints the API key.
+The concierge command starts a clean episode, records one `observe` action, seals the handshake run as `aborted`, retrieves the trace, independently verifies its seal, writes the export, and prints a credential-safe JSON summary. It never prints the API key.
 
 For an own-agent integration:
 
